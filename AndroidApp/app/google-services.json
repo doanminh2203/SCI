@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "111498641339",
+    "project_id": "sciproject-55261",
+    "storage_bucket": "sciproject-55261.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:111498641339:android:46bb30b334c9a342830e9e",
+        "android_client_info": {
+          "package_name": "com.example.sci"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBcIXVW0VhDUqZXk4ni4gKyxvGS0osHS0w"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
