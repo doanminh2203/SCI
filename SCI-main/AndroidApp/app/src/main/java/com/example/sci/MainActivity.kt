@@ -21,13 +21,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AcUnit
 import androidx.compose.material.icons.filled.Add
@@ -85,10 +85,9 @@ import com.example.sci.auth.AuthViewModel
 import com.example.sci.auth.LoginScreen
 import com.example.sci.auth.RegisterScreen
 import com.example.sci.data.repository.DeviceRepository
-import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
-
 data class UiTab(
     val id: String,
     val name: String,
@@ -119,17 +118,18 @@ fun AppNavigation() {
     val snackbarHostState = remember { SnackbarHostState() }
     val authViewModel = remember { AuthViewModel() }
     val authState by authViewModel.uiState.collectAsState()
-
     val deviceRepository = remember { DeviceRepository() }
-    val db = remember { FirebaseFirestore.getInstance() }
 
-    val homeId = "home_001"
+    val firebaseUser = FirebaseAuth.getInstance().currentUser
+    val userId = firebaseUser?.uid
+    val homeId = "default_home"
+
     val startDestination = if (authState.isLoggedIn) NavRoutes.HOME else NavRoutes.LOGIN
 
     val tabs = remember { mutableStateListOf<UiTab>() }
     val devices = remember { mutableStateListOf<Device>() }
+    var isHomeDataLoading by remember { mutableStateOf(false) }
 
-    // Kết nối MQTT khi app vào
     LaunchedEffect(Unit) {
         MqttManager.setOnMessageReceived { topic, payload ->
             scope.launch {
@@ -159,44 +159,22 @@ fun AppNavigation() {
         }
     }
 
-    LaunchedEffect(authState.isLoggedIn) {
-        if (authState.isLoggedIn) {
+    LaunchedEffect(authState.isLoggedIn, userId) {
+        if (authState.isLoggedIn && userId != null) {
+            isHomeDataLoading = true
+
             try {
-                val remoteTabs = deviceRepository.loadTabs(homeId)
-                val remoteDevices = deviceRepository.loadDevices(homeId)
+                deviceRepository.ensureDefaultHomeAndTabs(userId, homeId)
 
-                if (remoteTabs.isEmpty()) {
-                    val defaultTabs = listOf(
-                        UiTab("tab_favorites", "Favorites", 1),
-                        UiTab("tab_living_room", "Living room", 2),
-                        UiTab("tab_bedroom", "Bedroom", 3)
-                    )
+                val remoteTabs = deviceRepository.loadTabs(userId, homeId)
+                val remoteDevices = deviceRepository.loadDevices(userId, homeId)
 
-                    for (tab in defaultTabs) {
-                        db.collection("homes")
-                            .document(homeId)
-                            .collection("tabs")
-                            .document(tab.id)
-                            .set(
-                                mapOf(
-                                    "name" to tab.name,
-                                    "order" to tab.order
-                                )
-                            )
-                            .await()
-                    }
-
-                    tabs.clear()
-                    tabs.addAll(defaultTabs)
-                } else {
-                    tabs.clear()
-                    tabs.addAll(remoteTabs)
-                }
+                tabs.clear()
+                tabs.addAll(remoteTabs)
 
                 devices.clear()
                 devices.addAll(remoteDevices)
 
-                // Subscribe topic state của các device đã load
                 MqttManager.connect(
                     onSuccess = {
                         remoteDevices.forEach { device ->
@@ -206,10 +184,13 @@ fun AppNavigation() {
                 )
             } catch (e: Exception) {
                 snackbarHostState.showSnackbar("Load data failed: ${e.message}")
+            } finally {
+                isHomeDataLoading = false
             }
         } else {
             tabs.clear()
             devices.clear()
+            isHomeDataLoading = false
         }
     }
 
@@ -236,146 +217,167 @@ fun AppNavigation() {
         }
 
         composable(NavRoutes.HOME) {
-            TuyaHomeScreen(
-                tabs = tabs,
-                devices = devices,
-                snackbarHostState = snackbarHostState,
-                onDeviceClick = { device ->
-                    navController.navigate(NavRoutes.detailRoute(Uri.encode(device.id)))
-                },
-                onQuickToggle = { device ->
-                    val index = devices.indexOfFirst { it.id == device.id }
-                    if (index != -1) {
-                        val currentDevice = devices[index]
-                        val newState = !currentDevice.isOn
+            if (isHomeDataLoading) {
+                HomeLoadingScreen()
+            } else {
+                TuyaHomeScreen(
+                    tabs = tabs,
+                    devices = devices,
+                    snackbarHostState = snackbarHostState,
+                    onDeviceClick = { device ->
+                        navController.navigate(NavRoutes.detailRoute(Uri.encode(device.id)))
+                    },
+                    onQuickToggle = { device ->
+                        if (userId == null) return@TuyaHomeScreen
 
-                        devices[index] = currentDevice.copy(isOn = newState)
-
-                        scope.launch {
-                            try {
-                                deviceRepository.updateQuickToggle(
-                                    homeId = homeId,
-                                    deviceId = currentDevice.id,
-                                    isOn = newState
-                                )
-                            } catch (e: Exception) {
-                                snackbarHostState.showSnackbar(
-                                    "Quick toggle DB update failed: ${e.message}"
-                                )
-                            }
-                        }
-
-                        MqttManager.connect(
-                            onSuccess = {
-                                val payload =
-                                    """{"power":"${if (newState) "ON" else "OFF"}","distanceMm":${currentDevice.distanceMm},"timeS":${currentDevice.timeS}}"""
-
-                                MqttManager.publish(
-                                    topic = currentDevice.mqttSetTopic,
-                                    payload = payload,
-                                    onSuccess = {
-                                        scope.launch {
-                                            snackbarHostState.showSnackbar("Quick toggle sent to MQTT")
-                                        }
-                                    },
-                                    onError = { error ->
-                                        scope.launch {
-                                            snackbarHostState.showSnackbar("Quick toggle failed: $error")
-                                        }
-                                    }
-                                )
-                            },
-                            onError = { error ->
-                                scope.launch {
-                                    snackbarHostState.showSnackbar("MQTT connect error: $error")
-                                }
-                            }
-                        )
-                    }
-                },
-                onAddDevice = { mqttTopic, currentTabId ->
-                    val newDevice = createDeviceFromTopic(
-                        topic = mqttTopic,
-                        currentTabId = currentTabId,
-                        homeId = homeId
-                    )
-
-                    val duplicated = devices.any { it.id == newDevice.id }
-                    if (duplicated) {
-                        scope.launch {
-                            snackbarHostState.showSnackbar("Device already exists")
-                        }
-                    } else {
-                        devices.add(newDevice)
-
-                        scope.launch {
-                            try {
-                                deviceRepository.addDevice(
-                                    homeId = homeId,
-                                    device = newDevice
-                                )
-                                MqttManager.connect(
-                                    onSuccess = {
-                                        MqttManager.subscribe(newDevice.mqttStateTopic)
-                                    }
-                                )
-                                snackbarHostState.showSnackbar("Device added to database")
-                            } catch (e: Exception) {
-                                snackbarHostState.showSnackbar("Add device failed: ${e.message}")
-                            }
-                        }
-                    }
-                },
-                onDeleteDevice = { device ->
-                    devices.removeAll { it.id == device.id }
-
-                    scope.launch {
-                        try {
-                            deviceRepository.deleteDevice(
-                                homeId = homeId,
-                                deviceId = device.id
-                            )
-                            snackbarHostState.showSnackbar("Device deleted")
-                        } catch (e: Exception) {
-                            snackbarHostState.showSnackbar("Delete failed: ${e.message}")
-                        }
-                    }
-                },
-                onRenameTab = { tabId, newName ->
-                    val trimmedName = newName.trim()
-
-                    if (trimmedName.isBlank()) {
-                        scope.launch {
-                            snackbarHostState.showSnackbar("Tab name cannot be empty")
-                        }
-                    } else if (tabs.any { it.name.equals(trimmedName, ignoreCase = true) && it.id != tabId }) {
-                        scope.launch {
-                            snackbarHostState.showSnackbar("Tab name already exists")
-                        }
-                    } else {
-                        val index = tabs.indexOfFirst { it.id == tabId }
+                        val index = devices.indexOfFirst { it.id == device.id }
                         if (index != -1) {
-                            val oldTab = tabs[index]
-                            tabs[index] = oldTab.copy(name = trimmedName)
+                            val currentDevice = devices[index]
+                            val newState = !currentDevice.isOn
+
+                            devices[index] = currentDevice.copy(isOn = newState)
 
                             scope.launch {
                                 try {
-                                    db.collection("homes")
-                                        .document(homeId)
-                                        .collection("tabs")
-                                        .document(tabId)
-                                        .update("name", trimmedName)
-                                        .await()
-
-                                    snackbarHostState.showSnackbar("Renamed tab to $trimmedName")
+                                    deviceRepository.updateQuickToggle(
+                                        userId = userId,
+                                        homeId = homeId,
+                                        deviceId = currentDevice.id,
+                                        isOn = newState
+                                    )
                                 } catch (e: Exception) {
-                                    snackbarHostState.showSnackbar("Rename tab failed: ${e.message}")
+                                    snackbarHostState.showSnackbar(
+                                        "Quick toggle DB update failed: ${e.message}"
+                                    )
+                                }
+                            }
+
+                            MqttManager.connect(
+                                onSuccess = {
+                                    val payload =
+                                        """{"power":"${if (newState) "ON" else "OFF"}","distanceMm":${currentDevice.distanceMm},"timeS":${currentDevice.timeS}}"""
+
+                                    MqttManager.publish(
+                                        topic = currentDevice.mqttSetTopic,
+                                        payload = payload,
+                                        onSuccess = {
+                                            scope.launch {
+                                                snackbarHostState.showSnackbar("Quick toggle sent to MQTT")
+                                            }
+                                        },
+                                        onError = { error ->
+                                            scope.launch {
+                                                snackbarHostState.showSnackbar("Quick toggle failed: $error")
+                                            }
+                                        }
+                                    )
+                                },
+                                onError = { error ->
+                                    scope.launch {
+                                        snackbarHostState.showSnackbar("MQTT connect error: $error")
+                                    }
+                                }
+                            )
+                        }
+                    },
+                    onAddDevice = { mqttTopic, currentTabId ->
+                        if (userId == null) return@TuyaHomeScreen
+
+                        val newDevice = createDeviceFromTopic(
+                            topic = mqttTopic,
+                            currentTabId = currentTabId,
+                            homeId = homeId
+                        )
+
+                        val duplicated = devices.any { it.id == newDevice.id }
+                        if (duplicated) {
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Device already exists")
+                            }
+                        } else {
+                            devices.add(newDevice)
+
+                            scope.launch {
+                                try {
+                                    deviceRepository.addDevice(
+                                        userId = userId,
+                                        homeId = homeId,
+                                        device = newDevice
+                                    )
+
+                                    MqttManager.connect(
+                                        onSuccess = {
+                                            MqttManager.subscribe(newDevice.mqttStateTopic)
+                                        }
+                                    )
+
+                                    snackbarHostState.showSnackbar("Device added to database")
+                                } catch (e: Exception) {
+                                    snackbarHostState.showSnackbar("Add device failed: ${e.message}")
+                                }
+                            }
+                        }
+                    },
+                    onDeleteDevice = { device ->
+                        if (userId == null) return@TuyaHomeScreen
+
+                        devices.removeAll { it.id == device.id }
+
+                        scope.launch {
+                            try {
+                                deviceRepository.deleteDevice(
+                                    userId = userId,
+                                    homeId = homeId,
+                                    deviceId = device.id
+                                )
+                                snackbarHostState.showSnackbar("Device deleted")
+                            } catch (e: Exception) {
+                                snackbarHostState.showSnackbar("Delete failed: ${e.message}")
+                            }
+                        }
+                    },
+                    onRenameTab = { tabId, newName ->
+                        if (userId == null) return@TuyaHomeScreen
+
+                        val trimmedName = newName.trim()
+
+                        if (trimmedName.isBlank()) {
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Tab name cannot be empty")
+                            }
+                        } else if (tabs.any { it.name.equals(trimmedName, ignoreCase = true) && it.id != tabId }) {
+                            scope.launch {
+                                snackbarHostState.showSnackbar("Tab name already exists")
+                            }
+                        } else {
+                            val index = tabs.indexOfFirst { it.id == tabId }
+                            if (index != -1) {
+                                val oldTab = tabs[index]
+                                tabs[index] = oldTab.copy(name = trimmedName)
+
+                                scope.launch {
+                                    try {
+                                        com.google.firebase.firestore.FirebaseFirestore
+                                            .getInstance()
+                                            .collection("users")
+                                            .document(userId)
+                                            .collection("homes")
+                                            .document(homeId)
+                                            .collection("tabs")
+                                            .document(tabId)
+                                            .update("name", trimmedName)
+                                            .await()
+
+                                        snackbarHostState.showSnackbar("Renamed tab to $trimmedName")
+                                    } catch (e: Exception) {
+                                        snackbarHostState.showSnackbar("Rename tab failed: ${e.message}")
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            )
+                )
+            }
         }
 
         composable(
@@ -391,12 +393,15 @@ fun AppNavigation() {
                     tabName = resolveTabName(tabs, device.tabId),
                     onBack = { navController.popBackStack() },
                     onDelete = {
+                        if (userId == null) return@DeviceDetailScreen
+
                         devices.removeAll { it.id == device.id }
                         navController.popBackStack()
 
                         scope.launch {
                             try {
                                 deviceRepository.deleteDevice(
+                                    userId = userId,
                                     homeId = homeId,
                                     deviceId = device.id
                                 )
@@ -407,6 +412,8 @@ fun AppNavigation() {
                         }
                     },
                     onSave = { newIsOn, newDistance, newTime ->
+                        if (userId == null) return@DeviceDetailScreen
+
                         val index = devices.indexOfFirst { it.id == device.id }
                         if (index != -1) {
                             val distanceValue = newDistance.toIntOrNull() ?: 0
@@ -421,6 +428,7 @@ fun AppNavigation() {
                             scope.launch {
                                 try {
                                     deviceRepository.updateDeviceState(
+                                        userId = userId,
                                         homeId = homeId,
                                         deviceId = device.id,
                                         isOn = newIsOn,
@@ -444,7 +452,6 @@ fun AppNavigation() {
 
 fun detectDeviceTypeFromTopic(topic: String): DeviceType {
     val upperTopic = topic.uppercase()
-
     return when {
         upperTopic.contains("ABC") -> DeviceType.LIGHT
         upperTopic.contains("DEF") -> DeviceType.AIR_CONDITIONER
@@ -505,7 +512,7 @@ fun TuyaHomeScreen(
     onDeleteDevice: (Device) -> Unit,
     onRenameTab: (String, String) -> Unit
 ) {
-    var selectedTabId by remember { mutableStateOf(tabs.firstOrNull()?.id ?: "tab_default") }
+    var selectedTabId by remember { mutableStateOf("tab_favorites") }
     var showAddDialog by remember { mutableStateOf(false) }
     var showDeleteDialogFor by remember { mutableStateOf<Device?>(null) }
     var showRenameTabDialog by remember { mutableStateOf(false) }
@@ -556,10 +563,7 @@ fun TuyaHomeScreen(
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(
-                        Color(0xFF243746),
-                        Color(0xFF7D8A96)
-                    )
+                    listOf(Color(0xFF243746), Color(0xFF7D8A96))
                 )
             )
             .statusBarsPadding()
@@ -585,7 +589,7 @@ fun TuyaHomeScreen(
                 )
 
                 Text(
-                    text = "Easily manage all your smart home",
+                    text = "Easily manage all your smart laboratory",
                     color = Color.White.copy(alpha = 0.85f),
                     fontSize = 14.sp,
                     modifier = Modifier.padding(top = 6.dp, bottom = 22.dp)
@@ -673,18 +677,23 @@ fun HomeContainer(
             Spacer(modifier = Modifier.height(14.dp))
 
             Row(
-                horizontalArrangement = Arrangement.spacedBy(18.dp)
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(0.dp)
             ) {
                 tabs.sortedBy { it.order }.forEach { tab ->
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.clickable { onTabSelected(tab.id) }
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { onTabSelected(tab.id) }
+                            .padding(vertical = 4.dp)
                     ) {
                         Text(
                             text = tab.name,
                             color = if (tab.id == selectedTabId) Color(0xFF1F2D3A) else Color.Gray,
                             fontSize = 13.sp,
-                            fontWeight = if (tab.id == selectedTabId) FontWeight.SemiBold else FontWeight.Normal
+                            fontWeight = if (tab.id == selectedTabId) FontWeight.SemiBold else FontWeight.Normal,
+                            maxLines = 1
                         )
 
                         Spacer(modifier = Modifier.height(6.dp))
@@ -755,9 +764,7 @@ fun DeviceCard(
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     modifier = Modifier
                         .size(36.dp)
@@ -790,9 +797,7 @@ fun DeviceCard(
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            Column(
-                modifier = Modifier.clickable { onClick() }
-            ) {
+            Column(modifier = Modifier.clickable { onClick() }) {
                 Text(
                     text = device.name,
                     color = Color(0xFF1F2D3A),
@@ -826,15 +831,8 @@ fun DeviceCard(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column(
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(
-                        text = "Distance",
-                        color = Color.Gray,
-                        fontSize = 10.sp,
-                        maxLines = 1
-                    )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = "Distance", color = Color.Gray, fontSize = 10.sp, maxLines = 1)
                     Text(
                         text = "${device.distanceMm} mm",
                         color = Color(0xFF1F2D3A),
@@ -844,15 +842,8 @@ fun DeviceCard(
                     )
                 }
 
-                Column(
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text(
-                        text = "Time",
-                        color = Color.Gray,
-                        fontSize = 10.sp,
-                        maxLines = 1
-                    )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = "Time", color = Color.Gray, fontSize = 10.sp, maxLines = 1)
                     Text(
                         text = "${device.timeS} s",
                         color = Color(0xFF1F2D3A),
@@ -916,7 +907,7 @@ fun AddDeviceDialog(
                     value = topic,
                     onValueChange = { topic = it },
                     label = { Text("MQTT topic") },
-                    placeholder = { Text("Example: homes/home_001/raw/ABC_motor_01") },
+                    placeholder = { Text("Example: homes/default_home/raw/ABC_motor_01") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -926,9 +917,7 @@ fun AddDeviceDialog(
             Button(
                 onClick = {
                     val trimmed = topic.trim()
-                    if (trimmed.isNotEmpty()) {
-                        onAdd(trimmed)
-                    }
+                    if (trimmed.isNotEmpty()) onAdd(trimmed)
                 },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color.White,
@@ -999,9 +988,7 @@ fun RenameTabDialog(
             Button(
                 onClick = {
                     val trimmed = newName.trim()
-                    if (trimmed.isNotEmpty()) {
-                        onRename(trimmed)
-                    }
+                    if (trimmed.isNotEmpty()) onRename(trimmed)
                 },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = Color.White,
@@ -1060,10 +1047,7 @@ fun DeviceDetailScreen(
             .fillMaxSize()
             .background(
                 Brush.verticalGradient(
-                    listOf(
-                        Color(0xFF243746),
-                        Color(0xFF7D8A96)
-                    )
+                    listOf(Color(0xFF243746), Color(0xFF7D8A96))
                 )
             )
             .statusBarsPadding()
@@ -1082,9 +1066,7 @@ fun DeviceDetailScreen(
             ) {
                 Spacer(modifier = Modifier.height(4.dp))
 
-                Row(
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     IconButton(
                         onClick = onBack,
                         modifier = Modifier
@@ -1101,9 +1083,7 @@ fun DeviceDetailScreen(
 
                     Spacer(modifier = Modifier.width(12.dp))
 
-                    Column(
-                        modifier = Modifier.weight(1f)
-                    ) {
+                    Column(modifier = Modifier.weight(1f)) {
                         Text(
                             text = device.name,
                             color = Color.White,
@@ -1157,9 +1137,7 @@ fun DeviceDetailScreen(
                                     .padding(18.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column(
-                                    horizontalAlignment = Alignment.CenterHorizontally
-                                ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                     Box(
                                         modifier = Modifier
                                             .size(64.dp)
@@ -1239,9 +1217,7 @@ fun DeviceDetailScreen(
                             shape = RoundedCornerShape(24.dp),
                             colors = CardDefaults.cardColors(containerColor = Color.White)
                         ) {
-                            Column(
-                                modifier = Modifier.padding(18.dp)
-                            ) {
+                            Column(modifier = Modifier.padding(18.dp)) {
                                 Text(
                                     text = "Power",
                                     fontSize = 16.sp,
@@ -1255,9 +1231,7 @@ fun DeviceDetailScreen(
                                     modifier = Modifier.fillMaxWidth(),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Column(
-                                        modifier = Modifier.weight(1f)
-                                    ) {
+                                    Column(modifier = Modifier.weight(1f)) {
                                         Text(
                                             text = if (isOn) "Device is ON" else "Device is OFF",
                                             fontSize = 15.sp,
@@ -1292,9 +1266,7 @@ fun DeviceDetailScreen(
                             shape = RoundedCornerShape(24.dp),
                             colors = CardDefaults.cardColors(containerColor = Color.White)
                         ) {
-                            Column(
-                                modifier = Modifier.padding(18.dp)
-                            ) {
+                            Column(modifier = Modifier.padding(18.dp)) {
                                 Text(
                                     text = "Distance (mm)",
                                     fontSize = 16.sp,
@@ -1320,9 +1292,7 @@ fun DeviceDetailScreen(
                             shape = RoundedCornerShape(24.dp),
                             colors = CardDefaults.cardColors(containerColor = Color.White)
                         ) {
-                            Column(
-                                modifier = Modifier.padding(18.dp)
-                            ) {
+                            Column(modifier = Modifier.padding(18.dp)) {
                                 Text(
                                     text = "Time (s)",
                                     fontSize = 16.sp,
@@ -1387,6 +1357,48 @@ fun DeviceDetailScreen(
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun HomeLoadingScreen() {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    listOf(
+                        Color(0xFF243746),
+                        Color(0xFF7D8A96)
+                    )
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F6F8))
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 28.dp, vertical = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "Loading your lab...",
+                    color = Color(0xFF1F2D3A),
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    text = "Please wait a moment",
+                    color = Color.Gray,
+                    fontSize = 13.sp
+                )
             }
         }
     }
