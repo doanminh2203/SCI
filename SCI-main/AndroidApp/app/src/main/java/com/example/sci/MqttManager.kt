@@ -1,5 +1,5 @@
 package com.example.sci
-
+import com.example.sci.mqtt.PendingDeviceCommand
 import android.content.Context
 import android.util.Log
 
@@ -20,10 +20,22 @@ object MqttManager {
     private const val SERVER_URI = "ssl://yf0477b4.ala.us-east-1.emqxsl.com:8883"
     private const val USERNAME = "abc"
     private const val PASSWORD = "123"
-
+    private val pendingCommands = mutableMapOf<String, PendingDeviceCommand>()
     private var mqttClient: MqttAndroidClient? = null
     private var onMessageReceived: ((topic: String, payload: String) -> Unit)? = null
 
+
+    fun addPendingCommand(command: PendingDeviceCommand) {
+        pendingCommands[command.requestId] = command
+    }
+
+    fun getPendingCommand(requestId: String): PendingDeviceCommand? {
+        return pendingCommands[requestId]
+    }
+
+    fun removePendingCommand(requestId: String) {
+        pendingCommands.remove(requestId)
+    }
     fun init(context: Context) {
         if (mqttClient != null) return
 

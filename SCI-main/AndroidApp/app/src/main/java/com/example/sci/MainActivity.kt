@@ -59,6 +59,7 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -85,9 +86,14 @@ import com.example.sci.auth.AuthViewModel
 import com.example.sci.auth.LoginScreen
 import com.example.sci.auth.RegisterScreen
 import com.example.sci.data.repository.DeviceRepository
+import com.example.sci.mqtt.DeviceStateMessage
+import com.example.sci.mqtt.PendingDeviceCommand
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+
 data class UiTab(
     val id: String,
     val name: String,
@@ -128,12 +134,39 @@ fun AppNavigation() {
 
     val tabs = remember { mutableStateListOf<UiTab>() }
     val devices = remember { mutableStateListOf<Device>() }
+
     var isHomeDataLoading by remember { mutableStateOf(false) }
 
+    var tabListener by remember { mutableStateOf<ListenerRegistration?>(null) }
+    var deviceListener by remember { mutableStateOf<ListenerRegistration?>(null) }
+
+    // MQTT receive handler
     LaunchedEffect(Unit) {
         MqttManager.setOnMessageReceived { topic, payload ->
             scope.launch {
-                snackbarHostState.showSnackbar("RX: $topic -> $payload")
+                try {
+                    if (topic.endsWith("/state")) {
+                        val stateMessage = DeviceStateMessage.fromJson(payload)
+
+                        val index = devices.indexOfFirst { it.id == stateMessage.deviceId }
+                        if (index != -1 && stateMessage.success) {
+                            devices[index] = devices[index].copy(
+                                isOn = stateMessage.power == "ON",
+                                params = stateMessage.params
+                            )
+                        }
+
+                        stateMessage.requestId?.let { requestId ->
+                            MqttManager.removePendingCommand(requestId)
+                        }
+                    }
+
+                    if (topic.endsWith("/online")) {
+                        snackbarHostState.showSnackbar("Online topic: $payload")
+                    }
+                } catch (e: Exception) {
+                    snackbarHostState.showSnackbar("MQTT parse error: ${e.message}")
+                }
             }
         }
 
@@ -151,6 +184,14 @@ fun AppNavigation() {
         )
     }
 
+    // Clean listeners when composable leaves composition
+    DisposableEffect(Unit) {
+        onDispose {
+            tabListener?.remove()
+            deviceListener?.remove()
+        }
+    }
+
     LaunchedEffect(authState.isLoggedIn) {
         if (authState.isLoggedIn) {
             navController.navigate(NavRoutes.HOME) {
@@ -159,6 +200,7 @@ fun AppNavigation() {
         }
     }
 
+    // Firestore realtime listeners
     LaunchedEffect(authState.isLoggedIn, userId) {
         if (authState.isLoggedIn && userId != null) {
             isHomeDataLoading = true
@@ -166,19 +208,42 @@ fun AppNavigation() {
             try {
                 deviceRepository.ensureDefaultHomeAndTabs(userId, homeId)
 
-                val remoteTabs = deviceRepository.loadTabs(userId, homeId)
-                val remoteDevices = deviceRepository.loadDevices(userId, homeId)
+                tabListener?.remove()
+                deviceListener?.remove()
 
-                tabs.clear()
-                tabs.addAll(remoteTabs)
+                tabListener = deviceRepository.listenTabs(
+                    userId = userId,
+                    homeId = homeId,
+                    onChanged = { remoteTabs ->
+                        tabs.clear()
+                        tabs.addAll(remoteTabs)
+                    },
+                    onError = { e ->
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Tabs listener error: ${e.message}")
+                        }
+                    }
+                )
 
-                devices.clear()
-                devices.addAll(remoteDevices)
+                deviceListener = deviceRepository.listenDevices(
+                    userId = userId,
+                    homeId = homeId,
+                    onChanged = { remoteDevices ->
+                        devices.clear()
+                        devices.addAll(remoteDevices)
 
-                MqttManager.connect(
-                    onSuccess = {
-                        remoteDevices.forEach { device ->
-                            MqttManager.subscribe(device.mqttStateTopic)
+                        MqttManager.connect(
+                            onSuccess = {
+                                remoteDevices.forEach { device ->
+                                    MqttManager.subscribe(device.mqttStateTopic)
+                                    MqttManager.subscribe(device.mqttOnlineTopic)
+                                }
+                            }
+                        )
+                    },
+                    onError = { e ->
+                        scope.launch {
+                            snackbarHostState.showSnackbar("Devices listener error: ${e.message}")
                         }
                     }
                 )
@@ -188,6 +253,11 @@ fun AppNavigation() {
                 isHomeDataLoading = false
             }
         } else {
+            tabListener?.remove()
+            deviceListener?.remove()
+            tabListener = null
+            deviceListener = null
+
             tabs.clear()
             devices.clear()
             isHomeDataLoading = false
@@ -254,8 +324,23 @@ fun AppNavigation() {
 
                             MqttManager.connect(
                                 onSuccess = {
-                                    val payload =
-                                        """{"power":"${if (newState) "ON" else "OFF"}","distanceMm":${currentDevice.distanceMm},"timeS":${currentDevice.timeS}}"""
+                                    val payload = when (currentDevice.type) {
+                                        DeviceType.LIGHT -> {
+                                            val distanceMm = getIntParam(currentDevice, "distanceMm")
+                                            val timeS = getIntParam(currentDevice, "timeS")
+                                            """{"power":"${if (newState) "ON" else "OFF"}","params":{"distanceMm":$distanceMm,"timeS":$timeS}}"""
+                                        }
+
+                                        DeviceType.AIR_CONDITIONER -> {
+                                            val temperatureC = getIntParam(currentDevice, "temperatureC")
+                                            val co2Percent = getIntParam(currentDevice, "co2Percent")
+                                            """{"power":"${if (newState) "ON" else "OFF"}","params":{"temperatureC":$temperatureC,"co2Percent":$co2Percent}}"""
+                                        }
+
+                                        else -> {
+                                            """{"power":"${if (newState) "ON" else "OFF"}"}"""
+                                        }
+                                    }
 
                                     MqttManager.publish(
                                         topic = currentDevice.mqttSetTopic,
@@ -308,6 +393,7 @@ fun AppNavigation() {
                                     MqttManager.connect(
                                         onSuccess = {
                                             MqttManager.subscribe(newDevice.mqttStateTopic)
+                                            MqttManager.subscribe(newDevice.mqttOnlineTopic)
                                         }
                                     )
 
@@ -357,8 +443,7 @@ fun AppNavigation() {
 
                                 scope.launch {
                                     try {
-                                        com.google.firebase.firestore.FirebaseFirestore
-                                            .getInstance()
+                                        FirebaseFirestore.getInstance()
                                             .collection("users")
                                             .document(userId)
                                             .collection("homes")
@@ -411,42 +496,97 @@ fun AppNavigation() {
                             }
                         }
                     },
-                    onSave = { newIsOn, newDistance, newTime ->
-                        if (userId == null) return@DeviceDetailScreen
+                    onSave = { newIsOn, param1, param2 ->
+                        val requestId = "req_${System.currentTimeMillis()}"
 
-                        val index = devices.indexOfFirst { it.id == device.id }
-                        if (index != -1) {
-                            val distanceValue = newDistance.toIntOrNull() ?: 0
-                            val timeValue = newTime.toIntOrNull() ?: 0
+                        val safeParam1 = param1.toIntOrNull() ?: 0
+                        val safeParam2 = param2.toIntOrNull() ?: 0
 
-                            devices[index] = devices[index].copy(
-                                isOn = newIsOn,
-                                distanceMm = distanceValue,
-                                timeS = timeValue
-                            )
+                        val payload = when (device.type) {
+                            DeviceType.LIGHT -> {
+                                """{
+                                    "requestId":"$requestId",
+                                    "power":"${if (newIsOn) "ON" else "OFF"}",
+                                    "params":{
+                                        "distanceMm":$safeParam1,
+                                        "timeS":$safeParam2
+                                    }
+                                }""".trimIndent()
+                            }
 
-                            scope.launch {
-                                try {
-                                    deviceRepository.updateDeviceState(
-                                        userId = userId,
-                                        homeId = homeId,
-                                        deviceId = device.id,
-                                        isOn = newIsOn,
-                                        distanceMm = distanceValue,
-                                        timeS = timeValue
-                                    )
-                                    snackbarHostState.showSnackbar("Device updated in database")
-                                } catch (e: Exception) {
-                                    snackbarHostState.showSnackbar(
-                                        "Database update failed: ${e.message}"
-                                    )
-                                }
+                            DeviceType.AIR_CONDITIONER -> {
+                                """{
+                                    "requestId":"$requestId",
+                                    "power":"${if (newIsOn) "ON" else "OFF"}",
+                                    "params":{
+                                        "temperatureC":$safeParam1,
+                                        "co2Percent":$safeParam2
+                                    }
+                                }""".trimIndent()
+                            }
+
+                            else -> {
+                                """{
+                                    "requestId":"$requestId",
+                                    "power":"${if (newIsOn) "ON" else "OFF"}"
+                                }""".trimIndent()
                             }
                         }
+
+                        MqttManager.addPendingCommand(
+                            PendingDeviceCommand(
+                                requestId = requestId,
+                                deviceId = device.id
+                            )
+                        )
+
+                        MqttManager.publish(
+                            topic = device.mqttSetTopic,
+                            payload = payload,
+                            onSuccess = {
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Command sent. Waiting for device...")
+                                }
+                            },
+                            onError = { error ->
+                                MqttManager.removePendingCommand(requestId)
+                                scope.launch {
+                                    snackbarHostState.showSnackbar("Publish failed: $error")
+                                }
+                            }
+                        )
                     }
                 )
             }
         }
+    }
+}
+
+fun getIntParam(device: Device, key: String, defaultValue: Int = 0): Int {
+    val value = device.params[key]
+    return when (value) {
+        is Int -> value
+        is Long -> value.toInt()
+        is Double -> value.toInt()
+        is Float -> value.toInt()
+        is String -> value.toIntOrNull() ?: defaultValue
+        else -> defaultValue
+    }
+}
+
+fun defaultParamsByType(type: DeviceType): Map<String, Any> {
+    return when (type) {
+        DeviceType.LIGHT -> mapOf(
+            "distanceMm" to 100,
+            "timeS" to 1
+        )
+
+        DeviceType.AIR_CONDITIONER -> mapOf(
+            "temperatureC" to 26,
+            "co2Percent" to 45
+        )
+
+        else -> emptyMap()
     }
 }
 
@@ -489,16 +629,52 @@ fun createDeviceFromTopic(topic: String, currentTabId: String, homeId: String): 
         tabId = currentTabId,
         isOn = false,
         type = type,
-        distanceMm = 100,
-        timeS = 1,
         mqttSetTopic = "homes/$homeId/devices/$safeDeviceId/set",
         mqttStateTopic = "homes/$homeId/devices/$safeDeviceId/state",
-        mqttOnlineTopic = "homes/$homeId/devices/$safeDeviceId/online"
+        mqttOnlineTopic = "homes/$homeId/devices/$safeDeviceId/online",
+        params = defaultParamsByType(type)
     )
 }
 
 fun resolveTabName(tabs: List<UiTab>, tabId: String): String {
     return tabs.firstOrNull { it.id == tabId }?.name ?: tabId
+}
+
+@Composable
+fun HomeLoadingScreen() {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    listOf(Color(0xFF243746), Color(0xFF7D8A96))
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F6F8))
+        ) {
+            Column(
+                modifier = Modifier.padding(horizontal = 28.dp, vertical = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = "Loading your home...",
+                    color = Color(0xFF1F2D3A),
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Please wait a moment",
+                    color = Color.Gray,
+                    fontSize = 13.sp
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -519,7 +695,7 @@ fun TuyaHomeScreen(
 
     LaunchedEffect(tabs) {
         if (tabs.isNotEmpty() && tabs.none { it.id == selectedTabId }) {
-            selectedTabId = tabs.first().id
+            selectedTabId = tabs.sortedBy { it.order }.first().id
         }
     }
 
@@ -589,7 +765,7 @@ fun TuyaHomeScreen(
                 )
 
                 Text(
-                    text = "Easily manage all your smart laboratory",
+                    text = "Easily manage all your smart home",
                     color = Color.White.copy(alpha = 0.85f),
                     fontSize = 14.sp,
                     modifier = Modifier.padding(top = 6.dp, bottom = 22.dp)
@@ -756,6 +932,34 @@ fun DeviceCard(
         DeviceType.SENSOR -> Icons.Default.Sensors
     }
 
+    val firstLabel: String
+    val firstValue: String
+    val secondLabel: String
+    val secondValue: String
+
+    when (device.type) {
+        DeviceType.LIGHT -> {
+            firstLabel = "Distance"
+            firstValue = "${getIntParam(device, "distanceMm")} mm"
+            secondLabel = "Time"
+            secondValue = "${getIntParam(device, "timeS")} s"
+        }
+
+        DeviceType.AIR_CONDITIONER -> {
+            firstLabel = "Temp"
+            firstValue = "${getIntParam(device, "temperatureC")} °C"
+            secondLabel = "CO2"
+            secondValue = "${getIntParam(device, "co2Percent")} %"
+        }
+
+        else -> {
+            firstLabel = "-"
+            firstValue = "-"
+            secondLabel = "-"
+            secondValue = "-"
+        }
+    }
+
     Card(
         shape = RoundedCornerShape(22.dp),
         colors = CardDefaults.cardColors(
@@ -832,9 +1036,14 @@ fun DeviceCard(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(text = "Distance", color = Color.Gray, fontSize = 10.sp, maxLines = 1)
                     Text(
-                        text = "${device.distanceMm} mm",
+                        text = firstLabel,
+                        color = Color.Gray,
+                        fontSize = 10.sp,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = firstValue,
                         color = Color(0xFF1F2D3A),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -843,9 +1052,14 @@ fun DeviceCard(
                 }
 
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(text = "Time", color = Color.Gray, fontSize = 10.sp, maxLines = 1)
                     Text(
-                        text = "${device.timeS} s",
+                        text = secondLabel,
+                        color = Color.Gray,
+                        fontSize = 10.sp,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = secondValue,
                         color = Color(0xFF1F2D3A),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -1015,8 +1229,46 @@ fun DeviceDetailScreen(
     onSave: (Boolean, String, String) -> Unit
 ) {
     var isOn by remember(device.id) { mutableStateOf(device.isOn) }
-    var distanceMm by remember(device.id) { mutableStateOf(device.distanceMm.toString()) }
-    var timeS by remember(device.id) { mutableStateOf(device.timeS.toString()) }
+
+    val initialParam1 = when (device.type) {
+        DeviceType.LIGHT -> getIntParam(device, "distanceMm").toString()
+        DeviceType.AIR_CONDITIONER -> getIntParam(device, "temperatureC").toString()
+        else -> ""
+    }
+
+    val initialParam2 = when (device.type) {
+        DeviceType.LIGHT -> getIntParam(device, "timeS").toString()
+        DeviceType.AIR_CONDITIONER -> getIntParam(device, "co2Percent").toString()
+        else -> ""
+    }
+
+    var param1 by remember(device.id) { mutableStateOf(initialParam1) }
+    var param2 by remember(device.id) { mutableStateOf(initialParam2) }
+
+    val param1Label = when (device.type) {
+        DeviceType.LIGHT -> "Distance (mm)"
+        DeviceType.AIR_CONDITIONER -> "Temperature (°C)"
+        else -> "Parameter 1"
+    }
+
+    val param1Placeholder = when (device.type) {
+        DeviceType.LIGHT -> "Example: 120"
+        DeviceType.AIR_CONDITIONER -> "Example: 26"
+        else -> "Enter value"
+    }
+
+    val param2Label = when (device.type) {
+        DeviceType.LIGHT -> "Time (s)"
+        DeviceType.AIR_CONDITIONER -> "CO2 concentration (%)"
+        else -> "Parameter 2"
+    }
+
+    val param2Placeholder = when (device.type) {
+        DeviceType.LIGHT -> "Example: 3"
+        DeviceType.AIR_CONDITIONER -> "Example: 45"
+        else -> "Enter value"
+    }
+
     val snackbarHostState = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
 
@@ -1268,7 +1520,7 @@ fun DeviceDetailScreen(
                         ) {
                             Column(modifier = Modifier.padding(18.dp)) {
                                 Text(
-                                    text = "Distance (mm)",
+                                    text = param1Label,
                                     fontSize = 16.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFF1F2D3A)
@@ -1277,10 +1529,10 @@ fun DeviceDetailScreen(
                                 Spacer(modifier = Modifier.height(14.dp))
 
                                 OutlinedTextField(
-                                    value = distanceMm,
-                                    onValueChange = { distanceMm = it },
-                                    label = { Text("Enter distance") },
-                                    placeholder = { Text("Example: 120") },
+                                    value = param1,
+                                    onValueChange = { param1 = it },
+                                    label = { Text(param1Label) },
+                                    placeholder = { Text(param1Placeholder) },
                                     modifier = Modifier.fillMaxWidth(),
                                     singleLine = true,
                                     shape = RoundedCornerShape(18.dp)
@@ -1294,7 +1546,7 @@ fun DeviceDetailScreen(
                         ) {
                             Column(modifier = Modifier.padding(18.dp)) {
                                 Text(
-                                    text = "Time (s)",
+                                    text = param2Label,
                                     fontSize = 16.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFF1F2D3A)
@@ -1303,10 +1555,10 @@ fun DeviceDetailScreen(
                                 Spacer(modifier = Modifier.height(14.dp))
 
                                 OutlinedTextField(
-                                    value = timeS,
-                                    onValueChange = { timeS = it },
-                                    label = { Text("Enter time") },
-                                    placeholder = { Text("Example: 3") },
+                                    value = param2,
+                                    onValueChange = { param2 = it },
+                                    label = { Text(param2Label) },
+                                    placeholder = { Text(param2Placeholder) },
                                     modifier = Modifier.fillMaxWidth(),
                                     singleLine = true,
                                     shape = RoundedCornerShape(18.dp)
@@ -1316,24 +1568,7 @@ fun DeviceDetailScreen(
 
                         Button(
                             onClick = {
-                                val payload =
-                                    """{"power":"${if (isOn) "ON" else "OFF"}","distanceMm":${distanceMm.toIntOrNull() ?: 0},"timeS":${timeS.toIntOrNull() ?: 0}}"""
-
-                                MqttManager.publish(
-                                    topic = device.mqttSetTopic,
-                                    payload = payload,
-                                    onSuccess = {
-                                        onSave(isOn, distanceMm, timeS)
-                                        scope.launch {
-                                            snackbarHostState.showSnackbar("Saved and sent to MQTT")
-                                        }
-                                    },
-                                    onError = { error ->
-                                        scope.launch {
-                                            snackbarHostState.showSnackbar("Publish failed: $error")
-                                        }
-                                    }
-                                )
+                                onSave(isOn, param1, param2)
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -1357,48 +1592,6 @@ fun DeviceDetailScreen(
                         }
                     }
                 }
-            }
-        }
-    }
-}
-
-@Composable
-fun HomeLoadingScreen() {
-    Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(
-                        Color(0xFF243746),
-                        Color(0xFF7D8A96)
-                    )
-                )
-            ),
-        contentAlignment = Alignment.Center
-    ) {
-        Card(
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F6F8))
-        ) {
-            Column(
-                modifier = Modifier.padding(horizontal = 28.dp, vertical = 24.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-                Text(
-                    text = "Loading your lab...",
-                    color = Color(0xFF1F2D3A),
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Text(
-                    text = "Please wait a moment",
-                    color = Color.Gray,
-                    fontSize = 13.sp
-                )
             }
         }
     }

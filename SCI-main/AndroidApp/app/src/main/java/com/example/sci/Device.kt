@@ -6,11 +6,10 @@ data class Device(
     val tabId: String,
     val isOn: Boolean,
     val type: DeviceType,
-    val distanceMm: Int = 0,
-    val timeS: Int = 0,
     val mqttSetTopic: String = "",
     val mqttStateTopic: String = "",
-    val mqttOnlineTopic: String = ""
+    val mqttOnlineTopic: String = "",
+    val params: Map<String, Any> = emptyMap()
 )
 
 enum class DeviceType {
